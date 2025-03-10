@@ -1,0 +1,1 @@
+This is a simplified pytorch version SigLip model, with a main reference of transformers code.
