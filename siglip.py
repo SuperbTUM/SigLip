@@ -31,11 +31,13 @@ class SiglipvisionConfig:
             num_hidden_layer=12,  # no_hidden_layers
             num_attention_heads=12,
             num_channels=3,
+            num_patches=256,
             image_size=224,
             patch_size=16,
             layer_norm_eps=1e-6,
             attention_dropout=0.0,
             num_image_tokens: int = None,
+            version="siglip2",
             **kwargs
     ):
         super().__init__()
@@ -45,11 +47,13 @@ class SiglipvisionConfig:
         self.num_hidden_layers = num_hidden_layer
         self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
+        self.num_patches = num_patches
         self.patch_size = patch_size
         self.image_size = image_size
         self.attention_dropout = attention_dropout
         self.layer_norm_eps = layer_norm_eps
         self.num_image_tokens = num_image_tokens
+        self.version = version
 
 
 class SiglipVisionEmbedding(nn.Module):
@@ -135,6 +139,107 @@ class SiglipVisionEmbedding(nn.Module):
         else:
             embeddings = embeddings + self.position_embedding(self.position_ids)
         # [Batch_Size, Num_Patches, Embed_Dim]
+        return embeddings
+
+
+class Siglip2VisionEmbeddings(nn.Module):
+    def __init__(self, config: SiglipvisionConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.patch_size = config.patch_size
+
+        self.patch_embedding = nn.Linear(
+            in_features=config.num_channels * self.patch_size * self.patch_size,
+            out_features=self.embed_dim,
+        )
+
+        self.num_patches = config.num_patches
+        self.position_embedding_size = int(self.num_patches**0.5)
+        self.position_embedding = nn.Embedding(self.num_patches, self.embed_dim)
+
+    @staticmethod
+    def resize_positional_embeddings(
+        positional_embeddings: torch.Tensor,
+        spatial_shapes: torch.LongTensor,
+        max_length: int,
+    ) -> torch.Tensor:
+        """
+        Resize positional embeddings to image-specific size and pad to a fixed size.
+
+        Args:
+            positional_embeddings (`torch.Tensor`):
+                Position embeddings of shape (height, width, embed_dim)
+            spatial_shapes (`torch.LongTensor`):
+                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
+            max_length (`int`):
+                Maximum length of the positional embeddings to pad resized positional embeddings to
+
+        Returns:
+            `torch.Tensor`: Embeddings of shape (batch_size, max_length, embed_dim)
+        """
+        batch_size = spatial_shapes.shape[0]
+        embed_dim = positional_embeddings.shape[-1]
+        source_dtype = positional_embeddings.dtype
+
+        resulted_positional_embeddings = torch.empty(
+            (batch_size, max_length, embed_dim),
+            device=positional_embeddings.device,
+            dtype=source_dtype,
+        )
+
+        # (height, width, embed_dim) -> (1, embed_dim, height, width) for interpolation
+        positional_embeddings = positional_embeddings.permute(2, 0, 1).unsqueeze(0)
+
+        # Upcast to float32 on CPU because antialias is not supported for bfloat16/float16 on CPU
+        if positional_embeddings.device.type == "cpu":
+            positional_embeddings = positional_embeddings.to(torch.float32)
+
+        for i in range(batch_size):
+            # (1, dim, height, width) -> (1, dim, target_height, target_width)
+            height, width = spatial_shapes[i]
+            resized_embeddings = F.interpolate(
+                positional_embeddings,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+
+            # (1, dim, target_height, target_width) -> (target_height * target_width, dim)
+            resized_embeddings = resized_embeddings.reshape(embed_dim, height * width).transpose(0, 1)
+
+            # Cast to original dtype
+            resized_embeddings = resized_embeddings.to(source_dtype)
+
+            resulted_positional_embeddings[i, : height * width] = resized_embeddings
+            resulted_positional_embeddings[i, height * width :] = resized_embeddings[0]
+
+        return resulted_positional_embeddings
+
+    def forward(self, pixel_values: torch.FloatTensor, spatial_shapes: torch.LongTensor) -> torch.Tensor:
+        """
+        Args:
+            pixel_values (`torch.FloatTensor`):
+                Pixel values of shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
+            spatial_shapes (`List[Tuple[int, int]]`):
+                Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
+        """
+
+        # Apply patch embeddings to already patchified pixel values
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
+
+        # Get positional resized and padded positional embeddings
+        positional_embeddings = self.position_embedding.weight.reshape(
+            self.position_embedding_size, self.position_embedding_size, -1
+        )
+        resized_positional_embeddings = self.resize_positional_embeddings(
+            positional_embeddings, spatial_shapes, max_length=pixel_values.shape[1]
+        )
+
+        # Add positional embeddings to patch embeddings
+        embeddings = patch_embeds + resized_positional_embeddings
         return embeddings
 
 
@@ -311,16 +416,52 @@ class SiglipVisionTransformer(nn.Module):
         self.config = config
         embed_dim = config.hidden_size
 
-        self.embeddings = SiglipVisionEmbedding(config)
+        self.embeddings = SiglipVisionEmbedding(config) if config.version == "siglip" else Siglip2VisionEmbeddings(config)
+
         self.encoder = SigLipEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.head = SiglipMultiheadAttentionPoolingHead(config)
 
-    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
-        # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimention]
-        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding)
+    @staticmethod
+    def convert_image_to_patches(image: torch.FloatTensor, patch_size: int) -> torch.FloatTensor:
+        """
+        Convert 4D array image of shape (bs, num_channel, image_height, image_width) into 2D array of patches of shape
+        (bs, num_patches_height * num_patches_width, patch_size * patch_size * num_channels).
+        """
+        batch_size, num_channels, image_height, image_width = image.size()
+        num_patches_height = image_height // patch_size
+        num_patches_width = image_width // patch_size
+        patched_image = image.reshape(batch_size, num_channels, num_patches_height, patch_size, num_patches_width, patch_size)
+        patched_image = patched_image.permute(0, 2, 4, 3, 5, 1)
+        patched_image = patched_image.reshape(batch_size, num_patches_height * num_patches_width, -1)
+        return patched_image
 
-        last_hidden_state = self.encoder(inputs_embeds=hidden_states, attention_mask=None)
+    @staticmethod
+    def pad_along_first_dim(image: torch.FloatTensor, target_length: int, pad_value: int = 0) -> Tuple[torch.FloatTensor, torch.IntTensor]:
+        """
+        Pad the array along the first dimension.
+        """
+        bs, n_patch, _ = image.size()
+        current_length = n_patch
+        padding_length = target_length - current_length
+        mask = torch.ones((bs, target_length), dtype=torch.int32)
+        if padding_length > 0:
+            paddings = (0, 0, 0, padding_length)
+            image = F.pad(image, paddings, mode="constant", value=pad_value)
+            mask[:, -padding_length:] = 0
+        return image, mask
+
+    def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False, spatial_shapes: torch.LongTensor = None) -> torch.Tensor:
+        # pixel_values: [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embedding_Dimension]
+        attention_mask = None
+        if self.config.version == "siglip":
+            hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding)
+        else:
+            pixel_values, attention_mask = self.pad_along_first_dim(self.convert_image_to_patches(pixel_values, self.config.patch_size), self.config.num_patches)
+            hidden_states = self.embeddings(pixel_values, spatial_shapes)
+            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
+
+        last_hidden_state = self.encoder(inputs_embeds=hidden_states, attention_mask=attention_mask)
 
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
@@ -338,7 +479,10 @@ class SiglipVisionModel(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool) -> Tuple:
         # [Batch_Size, Channels, Height, Width] -> [Batch_size, Num_Patches, Embed_Dim]
-        return self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
+        bs, _, h, w = pixel_values.shape
+        spatial_shapes = torch.tensor([h // self.config.patch_size, w // self.config.patch_size]).repeat(bs, 1)
+        return self.vision_model(pixel_values=pixel_values, interpolate_pos_encoding=interpolate_pos_encoding,
+                                 spatial_shapes=spatial_shapes)
 
 
 class SiglipTextConfig:
