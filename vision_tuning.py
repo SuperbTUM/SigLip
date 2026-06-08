@@ -4,7 +4,8 @@ from data_preparation import *
 from checkpoint import *
 from losses import TokenMaxSimLoss, mine_hard_triplets, MMSupConAndProxyCE
 from evaluation import R1_mAP_eval_pt
-from locked_image_tuning import tuning_vision_projection, prompt_tuning_variable_dataset
+from locked_image_tuning import prompt_tuning_variable_dataset
+from eva02_clip import EVAReIDEncoder
 
 import torch
 import torch.nn as nn
@@ -23,25 +24,39 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def vision_tuning(
         base_model,
         prompt_learners,
-        classifiers,
         dataset_names,
         input_sizes,
         device
 ):
-    if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth"):
-        classifiers = load_checkpoint(None, None, classifiers, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)[2]
     if os.path.exists(f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth"):
         base_model, prompt_learners, _, _, _, _ = load_checkpoint(base_model, prompt_learners, None, None, None, f"checkpoint_epoch_{N_EPOCHS_LoRA}.pth", device)
     # --- 1. Dataloaders and Classifiers for each dataset ---
     train_dataloaders = []
     classifier_params = []
 
-    for dataset_name, input_size, classifier in zip(dataset_names, input_sizes, classifiers):
-        train_dataloader, _, _, _, _ = create_dataloader(dataset_name, input_size, "train", True)
+    classifiers = []
+    
+    for dataset_name, input_size in zip(dataset_names, input_sizes):
+        train_dataloader, _, n_cls, _, _ = create_dataloader(dataset_name, input_size, "train", True)
+        classifier = nn.Sequential(
+            nn.BatchNorm1d(512),
+            nn.Linear(512, n_cls, bias=False),
+        ).to(device)
+        classifier[0].bias.requires_grad_(False)
+        nn.init.normal_(classifier[1].weight, std=0.01)
+        classifier_nonproj = nn.Sequential(
+            nn.BatchNorm1d(768),
+            nn.Linear(768, n_cls, bias=False),
+        ).to(device)
+        classifier_nonproj[0].bias.requires_grad_(False)
+        nn.init.normal_(classifier_nonproj[1].weight, std=0.01)
+        classifiers.append(classifier)
+        classifiers.append(classifier_nonproj)
         train_dataloaders.append(train_dataloader)
         
         # Add its parameters to the list
         classifier_params.extend(list(classifier.parameters()))
+        classifier_params.extend(list(classifier_nonproj.parameters()))
 
     num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
 
@@ -53,12 +68,11 @@ def vision_tuning(
     text_model.eval()
     text_model = text_model.to(device)
 
-    base_model.vision_model = base_model.vision_model.train()
+    vision_model = EVAReIDEncoder().train()
     
     # # This creates the *new* trainable LoRA parameters
     # if hasattr(base_model.vision_model, "peft_config"):
     #     del base_model.vision_model.peft_config
-    vision_model = base_model.vision_model
     params = []
     base_lr = 5e-5
     for name, param in vision_model.named_parameters():
@@ -129,13 +143,13 @@ def vision_tuning(
             with torch.no_grad():
                 modified_text_embedding = prompt_learners[i](text_model, label, cam)
             
-            image_features = image_features.float()
-            image_attention = image_attention.float()
-            last_hidden_state = last_hidden_state.float()
+            image_features = image_features.float() # 512
+            image_attention = image_attention[:, 0, :].float() # 768
+            last_hidden_state = last_hidden_state[:, 1:, :].float() # 768
             
             # Cross-entropy loss
-            logits = classifiers[i](image_features)
-            logits_preproj = classifiers[i+(len(classifiers)>>1)](image_attention)
+            logits = classifiers[i*len(dataset_names)](image_features)
+            logits_preproj = classifiers[i*len(dataset_names)+1](image_attention)
             loss_ce = 0.25 * criterion[i](logits, label) + 0.25 * criterion[i](logits_preproj, label) + criterion[i](F.normalize(image_features) @ F.normalize(modified_text_embedding).t() / 0.07, label)
 
             loss_triplet = mine_hard_triplets(image_features, label) + mine_hard_triplets(image_attention, label)
@@ -166,7 +180,7 @@ def vision_tuning(
     # vision_model = vision_model.merge_and_unload()
     base_model.vision_model = vision_model
     save_checkpoint(base_model, prompt_learners, None, N_EPOCHS_VISION, None, optimizer, scheduler)
-    return base_model.eval()
+    return vision_model.eval()
 
 def test(model,
          dataset_name,
@@ -181,6 +195,7 @@ def test(model,
             label = label.to(device)
             cam = cam.to(device)
             test_feat, test_attention = model.vision_model(pixel_values=img, interpolate_pos_encoding=False)[:2]
+            test_attention = test_attention[:, 0, :]
             evaluator.update((torch.cat((test_feat, test_attention), dim=1), label, cam))
     cmc, mAP = evaluator.compute()[:2]
     evaluator.reset()
@@ -191,16 +206,11 @@ if __name__ == "__main__":
     input_sizes = [(256, 128), (224, 224)]
     class_names_list = ["person", "vehicle"]
     
-    # Get the pre-tuned base model and prompt learners from locked image tuning
-    base_model, classifiers = tuning_vision_projection(dataset_names, input_sizes, DEVICE)
-    for i, dataset_name in enumerate(dataset_names):
-        cmc1, cmc5, cmc10, mAP = test(base_model, dataset_name, input_sizes[i], DEVICE)
-        print(f"Dataset: {dataset_name}, cmc 1: {cmc1}, cmc 5: {cmc5}, cmc 10: {cmc10}, mAP: {mAP}")
-        torch.cuda.empty_cache()    
+    base_model = model.load_weights(MODEL_NAME)
     base_model, prompt_learners = prompt_tuning_variable_dataset(base_model, dataset_names, input_sizes, class_names_list, DEVICE)
 
     # Run LoRA vision tuning
-    model = vision_tuning(base_model, prompt_learners, classifiers, dataset_names, input_sizes, DEVICE)
+    model = vision_tuning(base_model, prompt_learners, dataset_names, input_sizes, DEVICE)
     
     for i, dataset_name in enumerate(dataset_names):
         cmc1, cmc5, cmc10, mAP = test(model, dataset_name, input_sizes[i], DEVICE)

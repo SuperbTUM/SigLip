@@ -704,6 +704,7 @@ class SiglipTextModel(nn.Module):
     def __init__(self, config: SiglipTextConfig):
         super().__init__()
         self.text_model = Siglip2TextTransformer(config)
+        self.text_projection = nn.Linear(config.hidden_size, 512)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.text_model.embeddings
@@ -727,7 +728,7 @@ class SiglipTextModel(nn.Module):
                                             attention_mask=attention_mask,
                                             inputs_embeds=inputs_embeds
         )
-        return pooler_output
+        return self.text_projection(pooler_output)
 
 
 class SiglipConfig(nn.Module):

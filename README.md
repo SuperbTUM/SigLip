@@ -1,4 +1,4 @@
-This is an exercise on SigLip2 model supervised fine-tuning. While I have some thoughts of leveraging the advantage of better retrieval capacity, I find it is more challenging to fine tune SigLip2 than CLIP.
+This is an exercise on SigLip2 text + EVA02 vision model supervised fine-tuning.
 
 Collaboration is more than welcomed.
 

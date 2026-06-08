@@ -4,6 +4,7 @@ from data_preparation import *
 from checkpoint import *
 # from teacher import teacher_model_output
 from losses import MMSupConAndProxyCE, SupConLoss, mine_hard_triplets
+from eva02_clip import EVAReIDEncoder
 
 import transformers
 import torch
@@ -86,169 +87,6 @@ class PromptLearner(nn.Module):
         return prompted_text_features
 
 
-def tuning_vision_projection(dataset_names,
-                             input_sizes,
-                             device):
-    base_model = model.load_weights(MODEL_NAME)
-    text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
-    ai_prompts = []
-    classifiers = []
-    classifiers_nonproj = []
-    classifier_params = []
-    
-    embedding_dim = base_model.config.vision_config.hidden_size
-
-    for dataset_name in dataset_names:
-        ai_prompt = []
-        with open(f"prompts_{dataset_name}_full.txt", "r", encoding="utf-8") as f:
-            ai_prompt += [prompt.strip() for prompt in f.readlines()]
-        token_ai_prompt = text_tokenizer(ai_prompt, padding=True, return_tensors="pt").input_ids.to(device)
-        ai_prompts.append(token_ai_prompt)
-    base_model.train()
-    base_model.text_model.eval()
-    for param in base_model.text_model.parameters():
-        param.requires_grad = False
-    for name, param in base_model.vision_model.named_parameters():
-        param.requires_grad = True
-    base_model = base_model.to(device)
-
-    train_dataloaders = []
-    n_clses = []
-    for dataset_name, input_size in zip(dataset_names, input_sizes):
-        train_dataloader, _, n_cls, _, _ = create_dataloader(dataset_name, input_size, "train", True, False, True)
-        train_dataloaders.append(train_dataloader)
-        n_clses.append(n_cls)
-
-        # Create classifier and move to device
-        # Classifier: BatchNorm + FC
-        classifier = nn.Sequential(
-            nn.BatchNorm1d(embedding_dim),
-            nn.Linear(embedding_dim, n_cls, bias=False),
-        ).to(device)
-        classifier[0].bias.requires_grad_(False)
-        nn.init.normal_(classifier[1].weight, std=0.01)
-        classifiers.append(classifier)
-
-        classifier_nonproj = nn.Sequential(
-            nn.BatchNorm1d(embedding_dim),
-            nn.Linear(embedding_dim, n_cls, bias=False)
-        ).to(device)
-        classifier_nonproj[0].bias.requires_grad_(False)
-        nn.init.normal_(classifier_nonproj[1].weight, std=0.01)
-        classifiers_nonproj.append(classifier_nonproj)
-        
-        # Add its parameters to the list
-        classifier_params.extend(list(classifier.parameters()))
-        classifier_params.extend(list(classifier_nonproj.parameters()))
-
-    real_sup_con_loss = SupConLoss(device)
-    info_nce_loss = MMSupConAndProxyCE(alpha_ce=1.0, alpha_rank=0.)
-    scaler = GradScaler(device)
-    base_lr = 5e-4
-    params = [
-        {'params': list(filter(lambda p: p.requires_grad, base_model.parameters())), 'lr': base_lr, 'weight_decay': 1e-4},
-        {'params': classifier_params, 'lr': base_lr * 2, 'weight_decay': 1e-4}    # Group 2: Classifier params
-    ]
-    optimizer = torch.optim.Adam(params, lr=base_lr, weight_decay=1e-4)
-    temperature_optimizer = torch.optim.Adam(list(real_sup_con_loss.parameters()) + list(info_nce_loss.parameters()), lr=1e-4)
-    
-    frozen_text_features_list = []
-    with torch.inference_mode():
-        batch_size = 32
-        frozen_text_feature_list = []
-        for n_cls, ai_prompt in zip(n_clses, ai_prompts):
-            for i in range(0, len(ai_prompt), batch_size):
-                text_features = base_model.text_model(ai_prompt[i:i+batch_size])
-                frozen_text_feature_list.append(text_features)
-            frozen_text_feature_list = torch.cat(frozen_text_feature_list, dim=0)
-            prompt_per_class = len(frozen_text_feature_list) // n_cls
-            if prompt_per_class > 1:
-                frozen_text_feature_list = frozen_text_feature_list.view(len(ai_prompt) // prompt_per_class, prompt_per_class, -1).mean(dim=1)
-            frozen_text_features_list.append(frozen_text_feature_list)
-    
-    # --- Training Loop ---
-    num_batches = max(len(loader) for loader in train_dataloaders) * len(train_dataloaders)
-    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    #     optimizer,
-    #     max_lr=5e-4,
-    #     total_steps=num_batches * N_EPOCHS_PRESTAGE,
-    #     pct_start=0.1,
-    #     div_factor=10,
-    #     final_div_factor=10
-    # )
-
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[
-            torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=0.1,      
-                end_factor=1.0,
-                total_iters=10
-            ), 
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, 
-                T_max=N_EPOCHS_PRESTAGE-10, 
-                eta_min=1e-6
-            )
-        ],
-        milestones=[10]
-    )
-
-    for epoch in range(N_EPOCHS_PRESTAGE):
-        loss_by_epoch = 0
-        dataloader_iters = [itertools.cycle(loader) for loader in train_dataloaders]
-        round_robin_iter = itertools.cycle(enumerate(dataloader_iters))
-        
-        for batch_idx in range(num_batches):
-
-            i, dataloader_iter = next(round_robin_iter)
-
-            batched_data = next(dataloader_iter)
-            image_tensor, label_batch, image_tensor_2 = batched_data[0], batched_data[1], batched_data[5]
-
-            optimizer.zero_grad()
-            temperature_optimizer.zero_grad()
-            total_loss = 0
-
-            label_batch = label_batch.to(device)
-            # frozen_text_feature = frozen_text_features_list[i][label_batch]
-
-            with autocast(device):
-                image_features_batch_2, image_attention_batch_2, image_last_hidden_state_batch_2 = base_model.get_image_features(image_tensor_2.to(device))
-                logits = classifiers[i](image_features_batch_2)
-                logits_nonproj = classifiers_nonproj[i](image_attention_batch_2)
-            # with torch.no_grad():
-            #     image_features_batch = base_model.get_image_features(image_tensor.to(device))[0]
-            
-            image_features_batch_2 = image_features_batch_2.float()
-            image_attention_batch_2 = image_attention_batch_2.float()
-            image_last_hidden_state_batch_2 = image_last_hidden_state_batch_2.mean(dim=1).float()
-            logits = logits.float()
-            logits_nonproj = logits_nonproj.float()
-            image_classification_loss = F.cross_entropy(logits, label_batch, label_smoothing=0.1) + F.cross_entropy(logits_nonproj, label_batch, label_smoothing=0.1)
-            image_contrastive_loss = \
-                            mine_hard_triplets(image_features_batch_2, label_batch) + mine_hard_triplets(image_attention_batch_2, label_batch) + \
-                            mine_hard_triplets(image_last_hidden_state_batch_2, label_batch)
-            # This loss should not use strong augmentation
-            # image_text_loss = info_nce_loss(image_features_batch_2, frozen_text_feature.detach(), label_batch, None, False)
-
-            loss = image_contrastive_loss + image_classification_loss #+ 0.1 * image_text_loss 
-            total_loss += loss
-
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            # scaler.step(temperature_optimizer)
-            scaler.update()
-            loss_by_epoch += total_loss.item()
-        scheduler.step()
-
-        print("Epoch: {}, Avg loss: {}".format(epoch, loss_by_epoch / num_batches))
-    # base_model.vision_model = base_model.vision_model.merge_and_unload()
-    save_checkpoint(base_model.eval(), None, real_sup_con_loss.temperature.exp().item(), N_EPOCHS_PRESTAGE, classifiers + classifiers_nonproj, optimizer, scheduler)
-    return base_model.eval(), classifiers + classifiers_nonproj
-
-
 def prompt_tuning_variable_dataset(base_model,
                                  dataset_names,
                                  input_sizes,
@@ -259,12 +97,14 @@ def prompt_tuning_variable_dataset(base_model,
         base_model, _, _, _, _, _ = load_checkpoint(base_model, None, None, None, None, f"checkpoint_epoch_{N_EPOCHS_PRESTAGE}.pth", device)
     text_tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_NAME)
     frozen_text_model = copy.deepcopy(base_model.text_model.eval())
-    base_model.vision_model.eval()
+    
+    vision_model = EVAReIDEncoder()
+    vision_model.eval()
     base_model.text_model.train()
-    for param in base_model.vision_model.parameters():
+    for param in vision_model.parameters():
         param.requires_grad = False
-    lora_model = base_model.to(device)
-    embedding_dim = lora_model.config.text_config.hidden_size
+    base_model = base_model.to(device)
+    embedding_dim = base_model.config.text_config.hidden_size
 
     # --- Dataloaders and Prompt Learners for each dataset ---
     train_dataloaders = []
@@ -284,7 +124,7 @@ def prompt_tuning_variable_dataset(base_model,
 
         prompt_learner = PromptLearner(
             text_tokenizer=text_tokenizer,
-            token_embedding=lora_model.text_model.get_input_embeddings(),
+            token_embedding=base_model.text_model.get_input_embeddings(),
             num_prompt_tokens=N_PROMPT_TOKEN,
             embedding_dim=embedding_dim,
             device=device,
@@ -299,7 +139,7 @@ def prompt_tuning_variable_dataset(base_model,
     sup_con_loss = SupConLoss(device)
     scaler = GradScaler(device)
     prompt_learner_optimizer = torch.optim.Adam(
-        prompt_learner_params, lr=3.5e-4, weight_decay=1e-4
+        prompt_learner_params + list(base_model.text_model.text_projection.parameters()), lr=3.5e-4, weight_decay=1e-4
     )
     temperature_optimizer = torch.optim.Adam(list(sup_con_loss.parameters()), lr=1e-4)
 
@@ -347,7 +187,7 @@ def prompt_tuning_variable_dataset(base_model,
                 image_tensor = image_tensor.to(device)
                 label = label.to(device)
                 cam = cam.to(device)
-                image_features = lora_model.get_image_features(image_tensor)[0]
+                image_features = vision_model(image_tensor)[0]
                 image_features_list.append(image_features)
                 image_label_list.append(label)
                 image_cam_list.append(cam)
@@ -385,10 +225,10 @@ def prompt_tuning_variable_dataset(base_model,
             # frozen_text_features_batch = frozen_text_features_list[dataset_idx][label_batch]
 
             with autocast(device):
-                text_features = prompt_learners[dataset_idx](lora_model.text_model, label_batch, image_cams_batch)
+                text_features = prompt_learners[dataset_idx](base_model.text_model, label_batch, image_cams_batch)
             
             text_features = text_features.float()
-            label = label_batch * prompt_learner.n_cams + image_cams_batch
+            label = label_batch 
             loss = sup_con_loss(image_features_batch, text_features, label, label) + \
             sup_con_loss(text_features, image_features_batch, label, label)
             total_loss += loss
